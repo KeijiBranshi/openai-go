@@ -79,13 +79,64 @@ func (d *decoderBuilder) newStructUnionDecoder(t reflect.Type) decoderFunc {
 	return func(n gjson.Result, v reflect.Value, state *decoderState) error {
 		if discriminated && n.Type == gjson.JSON && len(unionEntry.discriminatorKey) != 0 {
 			discriminator := n.Get(EscapeSJSONKey(unionEntry.discriminatorKey)).Value()
+
+			// Collect every variant whose discriminator value matches. A schema
+			// may legitimately register multiple Go structs under the same
+			// discriminator value (e.g. user/input/output "message" items in
+			// the Responses API), in which case structural fit is the
+			// tiebreaker.
+			var matching []discriminatedDecoder
 			for _, decoder := range discriminatedDecoders {
 				if discriminator == decoder.discriminator {
-					inner := v.FieldByIndex(decoder.field.Index)
-					return decoder.decoder(n, inner, state)
+					matching = append(matching, decoder)
 				}
 			}
-			return errors.New("apijson: was not able to find discriminated union variant")
+			if len(matching) == 0 {
+				return errors.New("apijson: was not able to find discriminated union variant")
+			}
+
+			// Fast path: exactly one variant claims this discriminator value.
+			// Preserve the original behavior, including its (looser) state.
+			if len(matching) == 1 {
+				inner := v.FieldByIndex(matching[0].field.Index)
+				return matching[0].decoder(n, inner, state)
+			}
+
+			// Multiple variants share this discriminator. Try each in strict
+			// mode and pick the best by exactness, mirroring the non-
+			// discriminated path below and newUnionDecoder.
+			bestExactness := loose - 1
+			bestIdx := -1
+			for i, decoder := range matching {
+				sub := decoderState{strict: state.strict, exactness: exact}
+				inner := v.FieldByIndex(decoder.field.Index)
+				err := decoder.decoder(n, inner, &sub)
+				if err != nil {
+					v.FieldByIndex(decoder.field.Index).SetZero()
+					continue
+				}
+				if sub.exactness == exact {
+					bestExactness = exact
+					bestIdx = i
+					break
+				}
+				if sub.exactness > bestExactness {
+					bestExactness = sub.exactness
+					bestIdx = i
+				}
+			}
+			if bestExactness < loose {
+				return errors.New("apijson: was not able to coerce discriminated union variant")
+			}
+			if guardStrict(state, bestExactness != exact) {
+				return errors.New("apijson: was not able to coerce discriminated union variant strictly")
+			}
+			for i, decoder := range matching {
+				if i != bestIdx {
+					v.FieldByIndex(decoder.field.Index).SetZero()
+				}
+			}
+			return nil
 		}
 
 		// Set bestExactness to worse than loose

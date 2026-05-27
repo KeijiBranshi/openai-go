@@ -180,7 +180,18 @@ func (d *decoderBuilder) newTypeDecoder(t reflect.Type) decoderFunc {
 	}
 
 	if !d.root && t.Implements(reflect.TypeOf((*json.Unmarshaler)(nil)).Elem()) {
-		return unmarshalerDecoder
+		// For known union variants, fall through to the struct decoder rather
+		// than handing off to the variant's own UnmarshalJSON. The struct
+		// decoder threads the parent decoderState through, which is required
+		// for newStructUnionDecoder to score variants by exactness when two
+		// or more share a discriminator value.
+		elem := t
+		for elem.Kind() == reflect.Pointer {
+			elem = elem.Elem()
+		}
+		if _, ok := unionVariants[elem]; !ok {
+			return unmarshalerDecoder
+		}
 	}
 	if !d.root && reflect.PointerTo(t).Implements(reflect.TypeOf((*json.Unmarshaler)(nil)).Elem()) {
 		if _, ok := unionVariants[t]; !ok {

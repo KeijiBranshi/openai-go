@@ -496,3 +496,84 @@ func TestMultiDiscriminatorUnion(t *testing.T) {
 		})
 	}
 }
+
+// Two variants registered under the same discriminator value with overlapping
+// shapes. Mirrors the Responses API "message" collision between
+// EasyInputMessageParam, ResponseInputItemMessageParam, and
+// ResponseOutputMessageParam — only the structurally exact match should win.
+
+type CollideShortMsg struct {
+	Role string `json:"role,omitzero" api:"required"`
+	Type string `json:"type,omitzero" api:"required"`
+	paramObject
+}
+
+type CollideLongMsg struct {
+	ID     string `json:"id,omitzero" api:"required"`
+	Role   string `json:"role,omitzero" api:"required"`
+	Status string `json:"status,omitzero" api:"required"`
+	Type   string `json:"type,omitzero" api:"required"`
+	paramObject
+}
+
+type CollidingUnion struct {
+	OfShort *CollideShortMsg `json:",omitzero,inline"`
+	OfLong  *CollideLongMsg  `json:",omitzero,inline"`
+	paramUnion
+}
+
+func (u *CollidingUnion) UnmarshalJSON(data []byte) error {
+	return apijson.UnmarshalRoot(data, u)
+}
+
+func init() {
+	// Register the less-specific variant first — this is the exact ordering
+	// that triggered the OfOutputMessage bug. A first-match-wins decoder picks
+	// OfShort for every "message" payload; the corrected decoder must score
+	// structural fit and pick OfLong when id/status are present.
+	apijson.RegisterUnion[CollidingUnion](
+		"type",
+		apijson.Discriminator[CollideShortMsg]("message"),
+		apijson.Discriminator[CollideLongMsg]("message"),
+	)
+}
+
+func TestDiscriminatorCollision(t *testing.T) {
+	tests := map[string]struct {
+		raw    string
+		target CollidingUnion
+	}{
+		"short_variant_no_extras": {
+			raw: `{"role":"user","type":"message"}`,
+			target: CollidingUnion{OfShort: &CollideShortMsg{
+				Role: "user",
+				Type: "message",
+			}},
+		},
+		"long_variant_picks_exact_over_extras": {
+			// Payload has id + status. OfShort would parse with "extras"
+			// exactness (two untyped fields). OfLong parses exactly. The fix
+			// scores both and must pick OfLong; without the fix, OfShort wins
+			// by registration order.
+			raw: `{"id":"msg_123","role":"assistant","status":"completed","type":"message"}`,
+			target: CollidingUnion{OfLong: &CollideLongMsg{
+				ID:     "msg_123",
+				Role:   "assistant",
+				Status: "completed",
+				Type:   "message",
+			}},
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			var dst CollidingUnion
+			if err := json.Unmarshal([]byte(test.raw), &dst); err != nil {
+				t.Fatalf("failed unmarshal with err: %v", err)
+			}
+			if !reflect.DeepEqual(dst, test.target) {
+				t.Fatalf("failed equality, got %#v but expected %#v", dst, test.target)
+			}
+		})
+	}
+}
